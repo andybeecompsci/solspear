@@ -4,14 +4,17 @@ from discord.ext import commands
 import os
 from dotenv import load_dotenv
 from database.db import db  # import our database connection
+from base58 import b58decode  # for validating solana addresses
 
 # load environment variables from .env file
 load_dotenv()
 
 class SolSpearBot(commands.Bot):
     def __init__(self):
+        # set up all intents we need
         intents = discord.Intents.default()
-        intents.message_content = False  # we don't need this for slash commands
+        intents.message_content = True
+        intents.guilds = True  # needed for guild/server related commands
         super().__init__(command_prefix='!', intents=intents)
 
     async def setup_hook(self):
@@ -20,10 +23,16 @@ class SolSpearBot(commands.Bot):
         await db.connect()
         print('connected to database!')
         
-        # sync slash commands
-        print('syncing commands...')
-        await self.tree.sync()
-        print(f'synced {len(self.tree.get_commands())} commands!')
+        # force sync slash commands globally
+        print('syncing commands globally...')
+        try:
+            await self.tree.sync()
+            print(f'synced {len(self.tree.get_commands())} commands!')
+            print('available commands:')
+            for cmd in self.tree.get_commands():
+                print(f'- /{cmd.name}: {cmd.description}')
+        except Exception as e:
+            print(f'failed to sync commands: {e}')
 
     async def close(self):
         # cleanup when bot shuts down
@@ -35,10 +44,13 @@ bot = SolSpearBot()
 @bot.event
 async def on_ready():
     print(f'{bot.user} has connected to Discord!')
-    print(f'Bot is in {len(bot.guilds)} servers')
-    print('Available commands:')
-    for cmd in bot.tree.get_commands():
-        print(f'- /{cmd.name}: {cmd.description}')
+    # force sync commands for each guild
+    for guild in bot.guilds:
+        try:
+            await bot.tree.sync(guild=guild)
+            print(f'synced commands for guild: {guild.name}')
+        except Exception as e:
+            print(f'failed to sync commands for guild {guild.name}: {e}')
 
 @bot.tree.command(name='private', description='Creates a private channel for you')
 async def create_private_channel(interaction: discord.Interaction):
@@ -73,6 +85,7 @@ async def create_private_channel(interaction: discord.Interaction):
             ephemeral=True
         )
 
+#db test to see if user gets put in db if user is not in db
 @bot.tree.command(name='dbtest', description='test db connection')
 async def db_test(interaction: discord.Interaction):
     try:
@@ -117,6 +130,61 @@ async def db_test(interaction: discord.Interaction):
             ephemeral=True
         )
 
+
+#track wallet command yippe
+@bot.tree.command(name='track', description='track a solana wallet')
+async def track_wallet(interaction: discord.Interaction, wallet_address: str):
+    try:
+        #validate solana wallet address( should be base 58 and 32 bytes)
+        try:
+            decoded = b58decode(wallet_address)
+            if len(decoded) != 32:
+                raise ValueError("Invalid wallet address length")
+        except Exception:
+            await interaction.response.send_message(
+                "that doesnt look like a solana wallet address, please check and try again",
+                ephemeral=True
+            )
+            return
+        
+        #create private channel for this wallet
+        channel_name = f"wallet-{wallet_address[:4]}-{wallet_address[-4:]}" #shows first and last 4 digitsof wallet address
+        overwrites = {
+            interaction.guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            interaction.guild.me: discord.PermissionOverwrite(read_messages=True),
+            interaction.user: discord.PermissionOverwrite(read_messages=True),
+        } 
+
+        channel = await interaction.guild.create_text_channel(
+            name = channel_name,
+            overwrites = overwrites,
+            reason=f"wallet tracking channel for {wallet_address}"
+        )
+
+        #store in db
+        await db.db.tracked_wallets.insert_one({
+            "user_id": str(interaction.user.id),
+            "wallet_address": wallet_address,
+            "channel_id": str(channel.id),
+            "created_at": discord.utils.utcnow().isoformat(),
+            "threshold": [] #for future threshold alerts, come back to this later
+        })
+
+        #send success message
+        await interaction.response.send_message(
+            f"now tracking wallet {wallet_address}! check {channel.mention} for updates",
+            ephemeral=True
+        )
+
+    except Exception as e:
+        print(f"error tracking wallet: {e}")
+        await interaction.response.send_message(
+            "oops something went wrong while setting up your wallet, please try again later",
+            ephemeral=True
+        )
+
+
+        
 #run bot with token
 TOKEN = os.getenv('DISCORD_TOKEN')
 bot.run(TOKEN)
