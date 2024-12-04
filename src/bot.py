@@ -8,6 +8,7 @@ from base58 import b58decode  # for validating solana addresses
 from discord.ext import tasks  # for creating background tasks
 from solana.rpc.api import Client  # solana blockchain api client
 from solders.pubkey import Pubkey  # for converting wallet address strings to Pubkey objects
+from solders.signature import Signature  # for converting signature strings to Signature objects
 import asyncio
 from datetime import datetime, timezone
 
@@ -52,46 +53,88 @@ class SolSpearBot(commands.Bot):
             tracked_wallets = await db.db.tracked_wallets.find({}).to_list(length=None)
 
             for wallet in tracked_wallets:
-                # fetch recent transactions for this wallet from solana
                 wallet_pubkey = Pubkey.from_string(wallet['wallet_address'])
-                response = self.solana.get_signatures_for_address(wallet_pubkey)
                 
-                # solders package returns transactions directly in response.value
-                if response and hasattr(response, 'value'):
-                    transactions = response.value
-                    
-                    # find most recent transaction we have processed
-                    last_sig = await db.db.transactions.find_one(
-                        {"wallet_address": wallet['wallet_address']},
-                        sort=[("timestamp", -1)]
-                    )
+                # get last processed signature for this wallet
+                last_sig = await db.db.transactions.find_one(
+                    {"wallet_address": wallet['wallet_address']},
+                    sort=[("slot", -1)]  # Sort by slot instead of timestamp
+                )
 
-                    # if this is the first time checking this wallet, only store the most recent transaction
-                    if not last_sig and transactions:
-                        tx = transactions[0]  # get most recent transaction
+                # For first time tracking, just get the latest transaction
+                if not last_sig:
+                    response = self.solana.get_signatures_for_address(
+                        wallet_pubkey,
+                        limit=1  # only get most recent
+                    )
+                    
+                    if response and hasattr(response, 'value') and response.value:
+                        tx = response.value[0]  # Most recent transaction
                         tx_data = {
                             "wallet_address": wallet['wallet_address'],
                             "signature": str(tx.signature),
-                            "timestamp": datetime.now(timezone.utc),
                             "slot": tx.slot,
                             "err": tx.err is not None,
-                            "memo": None,
                             "processed": False
                         }
                         await db.db.transactions.insert_one(tx_data)
-                        continue  # skip to next wallet
-                    
-                    # look through new transactions
-                    for tx in transactions:
-                        # skip if we have already processed this transaction
-                        if last_sig and tx.signature == last_sig['signature']:
-                            break
+                    continue
+
+                # For subsequent checks, get only new transactions
+                try:
+                    response = self.solana.get_signatures_for_address(
+                        wallet_pubkey,
+                        until=Signature.from_string(last_sig['signature']),  # Use until instead of before
+                        limit=5  # reduced limit to minimize spam
+                    )
+                except Exception as e:
+                    print(f"Error getting signatures: {e}")
+                    continue
+
+                if not response or not hasattr(response, 'value') or not response.value:
+                    continue
+
+                # Process transactions (they're already in newest-first order)
+                for tx in response.value:  # Remove reversed() since we want newest first
+                    try:
+                        # Get full transaction details with version support
+                        tx_details = self.solana.get_transaction(
+                            tx.signature,
+                            max_supported_transaction_version=0,
+                            encoding="json"  # Changed from jsonParsed to json
+                        )
                         
-                        # prepare transaction data for storage
+                        if not tx_details or not tx_details.value:
+                            print(f"Skipping transaction {tx.signature}: No transaction details")
+                            continue
+
+                        # Get transaction info
+                        tx_value = tx_details.value
+                        
+                        # Check if transaction has the required data
+                        if not hasattr(tx_value, 'transaction'):
+                            print(f"Skipping transaction {tx.signature}: No transaction data")
+                            continue
+
+                        # Extract account keys and check if our wallet is involved
+                        if hasattr(tx_value, 'meta') and tx_value.meta:
+                            account_keys = [str(key) for key in tx_value.transaction.message.account_keys]
+                            if wallet['wallet_address'] not in account_keys:
+                                continue
+                            
+                            # Skip if it's a tiny system program transfer
+                            if (
+                                len(tx_value.meta.inner_instructions or []) == 0  # No inner instructions (simple transfer)
+                                and hasattr(tx_value.meta, 'pre_balances')  # Has balance info
+                                and hasattr(tx_value.meta, 'post_balances')  # Has balance info
+                                and abs(tx_value.meta.pre_balances[0] - tx_value.meta.post_balances[0]) < 10000  # Less than 0.00001 SOL
+                            ):
+                                continue
+
+                        # prepare transaction data
                         tx_data = {
                             "wallet_address": wallet['wallet_address'],
                             "signature": str(tx.signature),
-                            "timestamp": datetime.now(timezone.utc),
                             "slot": tx.slot,
                             "err": tx.err is not None,
                             "memo": None,
@@ -104,13 +147,23 @@ class SolSpearBot(commands.Bot):
                         # send notification to the wallet's private channel
                         channel = self.get_channel(int(wallet['channel_id']))
                         if channel:
+                            # Determine if it's a swap/transfer based on error status
+                            tx_type = "Transaction"
+                            if hasattr(tx_value, 'meta') and tx_value.meta:
+                                if len(tx_value.meta.inner_instructions or []) > 0:
+                                    tx_type = "Swap/Transfer"
+
                             await channel.send(
-                                f"🔔 New transaction detected!\n"
+                                f"🔔 New {tx_type} detected!\n"
                                 f"Signature: `{tx_data['signature']}`\n"
                                 f"Status: {'✅ Success' if not tx_data['err'] else '❌ Failed'}\n"
                                 f"View transaction: https://solscan.io/tx/{tx_data['signature']}"
                             )
                             
+                    except Exception as e:
+                        print(f"Error processing transaction {tx.signature}: {str(e)}")
+                        continue
+
         except Exception as e:
             print(f"error in transaction monitoring: {e}")
     
