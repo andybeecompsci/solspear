@@ -1,3 +1,4 @@
+https://discord.com/oauth2/authorize?client_id=1313675271970226258&permissions=2147503184&integration_type=0&scope=applications.commands+bot
 
 # **SolSpear: Whale Tracking Bot for Discord**
 
